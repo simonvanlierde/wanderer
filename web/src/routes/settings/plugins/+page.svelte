@@ -12,6 +12,7 @@
         plugin_category_remap_preview,
         plugin_instances_create,
         plugin_instances_update,
+        plugin_sync,
     } from "$lib/stores/plugin_instance_store.js";
     import { show_toast } from "$lib/stores/toast_store.svelte.js";
     import {
@@ -26,6 +27,7 @@
     import { onMount, tick, untrack } from "svelte";
     import { _, locale } from "svelte-i18n";
     import { theme } from "$lib/stores/theme_store";
+    import { APIError } from "$lib/util/api_util";
 
     let { data } = $props();
 
@@ -158,6 +160,10 @@
             ];
             if (value) {
                 await maybePromptCategoryRemap(saved, plugin);
+            }
+            if (value && pluginCanSync(plugin)) {
+                // The first sync would otherwise wait for the nightly schedule.
+                void syncPlugin(plugin, saved, { quietWhenOff: true });
             }
         } catch (e) {
             show_toast({
@@ -479,6 +485,44 @@
         return instanceError(instance);
     }
 
+    function pluginCanSync(plugin: PluginProvider) {
+        const capabilities = plugin.capabilities ?? [];
+        return capabilities.includes("list_routes.v1") || capabilities.includes("list_activities.v1");
+    }
+
+    async function syncPlugin(
+        plugin: PluginProvider,
+        instance: PluginInstance,
+        options: { quietWhenOff?: boolean } = {},
+    ) {
+        if (!instance.id) {
+            return;
+        }
+        const values = { plugin: pluginTitle(plugin) };
+        try {
+            await plugin_sync(instance.id);
+            show_toast({
+                text: $_("plugin-sync-started", { values }),
+                icon: "check",
+                type: "success",
+            });
+        } catch (e) {
+            // An administrator can turn "Sync now" off (403). The plugin then
+            // syncs on schedule, which needs no message after switching it on.
+            if (options.quietWhenOff && e instanceof APIError && e.status === 403) {
+                return;
+            }
+            let text = $_("plugin-sync-error", { values });
+            if (e instanceof APIError && e.status === 429) {
+                const minutes = Math.max(1, Math.ceil((e.detail?.retryAfter ?? 60) / 60));
+                text = $_("plugin-sync-too-soon", { values: { ...values, minutes } });
+            } else if (e instanceof APIError && e.status === 409) {
+                text = $_("plugin-sync-running", { values });
+            }
+            show_toast({ text, icon: "close", type: "error" });
+        }
+    }
+
     function pluginRequiresConnection(
         plugin: PluginProvider,
         instance: PluginInstance | undefined,
@@ -550,6 +594,9 @@
                         oninfo={() => openPluginInfo(plugin)}
                         onclick={() => openPluginSettings(plugin)}
                         ontoggle={(value) => onPluginToggle(plugin, instance, value)}
+                        onsync={instance?.enabled && !settingsDisabled && pluginCanSync(plugin)
+                            ? () => syncPlugin(plugin, instance)
+                            : undefined}
                     ></PluginCard>
                 {/each}
             </div>
